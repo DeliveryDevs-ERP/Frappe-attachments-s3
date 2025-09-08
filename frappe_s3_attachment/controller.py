@@ -7,58 +7,82 @@ import re
 import string
 
 import boto3
-
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
 import frappe
-
-
 import magic
+from urllib.parse import quote
 
 
 class S3Operations(object):
 
     def __init__(self):
         """
-        Function to initialise the aws settings from frappe S3 File attachment
-        doctype.
+        Initialise AWS settings from the Single doctype 'S3 File Attachment'.
+        Ensures we will always talk to the bucket's *regional* endpoint.
         """
-        self.s3_settings_doc = frappe.get_doc(
-            'S3 File Attachment',
-            'S3 File Attachment',
-        )
-        if (
-            self.s3_settings_doc.aws_key and
-            self.s3_settings_doc.aws_secret
-        ):
-            self.S3_CLIENT = boto3.client(
-                's3',
-                aws_access_key_id=self.s3_settings_doc.aws_key,
-                aws_secret_access_key=self.s3_settings_doc.aws_secret,
-                region_name=self.s3_settings_doc.region_name,
-                config=Config(signature_version='s3v4')
-            )
-        else:
-            self.S3_CLIENT = boto3.client(
-                's3',
-                region_name=self.s3_settings_doc.region_name,
-                config=Config(signature_version='s3v4')
-            )
+        self.s3_settings_doc = frappe.get_doc('S3 File Attachment', 'S3 File Attachment')
+
+        # Core settings
         self.BUCKET = self.s3_settings_doc.bucket_name
         self.folder_name = self.s3_settings_doc.folder_name
 
+        # Caches
+        self._bucket_region = None
+        self._client_cache = {}
+
+        # If the doctype already stores region, cache it (ensure it's correct, e.g., "me-central-1")
+        if getattr(self.s3_settings_doc, "region_name", None):
+            self._bucket_region = self.s3_settings_doc.region_name.strip()
+
+        # Probe client (global) ONLY to discover bucket region when needed
+        probe_kwargs = {"config": Config(signature_version="s3v4")}
+        if self.s3_settings_doc.aws_key and self.s3_settings_doc.aws_secret:
+            probe_kwargs.update({
+                "aws_access_key_id": self.s3_settings_doc.aws_key,
+                "aws_secret_access_key": self.s3_settings_doc.aws_secret,
+            })
+        self._probe = boto3.client("s3", **probe_kwargs)
+
+    # ---------------- Region & client helpers ----------------
+
+    def _get_bucket_region(self) -> str:
+        """Discover and cache this bucket's region (None => us-east-1)."""
+        if self._bucket_region:
+            return self._bucket_region
+        resp = self._probe.get_bucket_location(Bucket=self.BUCKET)
+        region = resp.get("LocationConstraint") or "us-east-1"
+        self._bucket_region = region
+        return region
+
+    def _get_regional_client(self):
+        """Return an S3 client pinned to the bucket's region (virtual-hosted style)."""
+        region = self._get_bucket_region()
+        if region not in self._client_cache:
+            base_kwargs = {
+                "region_name": region,
+                "config": Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+            }
+            if self.s3_settings_doc.aws_key and self.s3_settings_doc.aws_secret:
+                base_kwargs.update({
+                    "aws_access_key_id": self.s3_settings_doc.aws_key,
+                    "aws_secret_access_key": self.s3_settings_doc.aws_secret,
+                })
+            self._client_cache[region] = boto3.client("s3", **base_kwargs)
+        return self._client_cache[region]
+
+    # ---------------- Utility helpers ----------------
+
     def strip_special_chars(self, file_name):
         """
-        Strips file charachters which doesnt match the regex.
+        Strips characters which don't match the regex (safe for S3/object headers).
         """
-        regex = re.compile('[^0-9a-zA-Z._-]')
-        file_name = regex.sub('', file_name)
-        return file_name
+        return re.sub(r'[^0-9a-zA-Z._-]', '', file_name)
 
     def key_generator(self, file_name, parent_doctype, parent_name):
         """
-        Generate keys for s3 objects uploaded with file name attached.
+        Generate keys for S3 objects; supports hook override.
         """
         hook_cmd = frappe.get_hooks().get("s3_key_generator")
         if hook_cmd:
@@ -70,137 +94,93 @@ class S3Operations(object):
                 )
                 if k:
                     return k.rstrip('/').lstrip('/')
-            except:
+            except Exception:
+                # ignore hook errors; fall back to default
                 pass
 
-        file_name = file_name.replace(' ', '_')
-        file_name = self.strip_special_chars(file_name)
-        key = ''.join(
-            random.choice(
-                string.ascii_uppercase + string.digits) for _ in range(8)
-        )
+        file_name = self.strip_special_chars(file_name.replace(' ', '_'))
+        key = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8))
 
         today = datetime.datetime.now()
         year = today.strftime("%Y")
         month = today.strftime("%m")
         day = today.strftime("%d")
 
-        doc_path = None
+        if self.folder_name:
+            return f"{self.folder_name}/{year}/{month}/{day}/{parent_doctype}/{key}_{file_name}"
+        return f"{year}/{month}/{day}/{parent_doctype}/{key}_{file_name}"
 
-        if not doc_path:
-            if self.folder_name:
-                final_key = self.folder_name + "/" + year + "/" + month + \
-                    "/" + day + "/" + parent_doctype + "/" + key + "_" + \
-                    file_name
-            else:
-                final_key = year + "/" + month + "/" + day + "/" + \
-                    parent_doctype + "/" + key + "_" + file_name
-            return final_key
-        else:
-            final_key = doc_path + '/' + key + "_" + file_name
-            return final_key
+    # ---------------- Core ops ----------------
 
-    def upload_files_to_s3_with_key(
-            self, file_path, file_name, is_private, parent_doctype, parent_name
-    ):
+    def upload_files_to_s3_with_key(self, file_path, file_name, is_private, parent_doctype, parent_name):
         """
-        Uploads a new file to S3.
-        Strips the file extension to set the content_type in metadata.
+        Upload a new file to S3 with correct ContentType and metadata.
         """
         mime_type = magic.from_file(file_path, mime=True)
         key = self.key_generator(file_name, parent_doctype, parent_name)
-        content_type = mime_type
+        s3 = self._get_regional_client()
+
+        extra = {
+            "ContentType": mime_type,
+            "Metadata": {"ContentType": mime_type, "file_name": file_name},
+        }
+        if not is_private:
+            # Public files explicitly set ACL; private files rely on bucket policy
+            extra["ACL"] = "public-read"
+
         try:
-            if is_private:
-                self.S3_CLIENT.upload_file(
-                    file_path, self.BUCKET, key,
-                    ExtraArgs={
-                        "ContentType": content_type,
-                        "Metadata": {
-                            "ContentType": content_type,
-                            "file_name": file_name
-                        }
-                    }
-                )
-            else:
-                self.S3_CLIENT.upload_file(
-                    file_path, self.BUCKET, key,
-                    ExtraArgs={
-                        "ContentType": content_type,
-                        "ACL": 'public-read',
-                        "Metadata": {
-                            "ContentType": content_type,
-
-                        }
-                    }
-                )
-
+            s3.upload_file(file_path, self.BUCKET, key, ExtraArgs=extra)
         except boto3.exceptions.S3UploadFailedError:
             frappe.throw(frappe._("File Upload Failed. Please try again."))
         return key
 
     def delete_from_s3(self, key):
-        """Delete file from s3"""
-        self.s3_settings_doc = frappe.get_doc(
-            'S3 File Attachment',
-            'S3 File Attachment',
-        )
+        """Delete file from S3 (if setting enabled)."""
+        # Refresh in case setting changed
+        self.s3_settings_doc = frappe.get_doc('S3 File Attachment', 'S3 File Attachment')
 
         if self.s3_settings_doc.delete_file_from_cloud:
-            s3_client = boto3.client(
-                's3',
-                aws_access_key_id=self.s3_settings_doc.aws_key,
-                aws_secret_access_key=self.s3_settings_doc.aws_secret,
-                region_name=self.s3_settings_doc.region_name,
-                config=Config(signature_version='s3v4')
-            )
-
+            s3 = self._get_regional_client()
             try:
-                s3_client.delete_object(
-                    Bucket=self.s3_settings_doc.bucket_name,
-                    Key=key
-                )
+                s3.delete_object(Bucket=self.s3_settings_doc.bucket_name, Key=key)
             except ClientError:
                 frappe.throw(frappe._("Access denied: Could not delete file"))
 
     def read_file_from_s3(self, key):
         """
-        Function to read file from a s3 file.
+        Read object bytes/stream from S3 (returns GetObject response).
         """
-        return self.S3_CLIENT.get_object(Bucket=self.BUCKET, Key=key)
+        s3 = self._get_regional_client()
+        return s3.get_object(Bucket=self.BUCKET, Key=key)
 
     def get_url(self, key, file_name=None):
         """
-        Return url.
-
-        :param bucket: s3 bucket name
-        :param key: s3 object key
+        Return a presigned GET URL using the *regional* endpoint.
         """
-        if self.s3_settings_doc.signed_url_expiry_time:
-            self.signed_url_expiry_time = self.s3_settings_doc.signed_url_expiry_time # noqa
-        else:
-            self.signed_url_expiry_time = 120
-        params = {
-                'Bucket': self.BUCKET,
-                'Key': key,
+        s3 = self._get_regional_client()
+        expiry = getattr(self.s3_settings_doc, "signed_url_expiry_time", None) or 120
 
-        }
+        params = {"Bucket": self.BUCKET, "Key": key.lstrip("/")}
         if file_name:
-            params['ResponseContentDisposition'] = 'filename={}'.format(file_name)
+            # Standards-compliant Content-Disposition (handles spaces/UTF-8)
+            safe_ascii = file_name.replace('"', "'")
+            utf8_quoted = quote(file_name, safe="")
+            params["ResponseContentDisposition"] = (
+                f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{utf8_quoted}'
+            )
 
-        url = self.S3_CLIENT.generate_presigned_url(
-            'get_object',
+        return s3.generate_presigned_url(
+            ClientMethod="get_object",
             Params=params,
-            ExpiresIn=self.signed_url_expiry_time,
+            ExpiresIn=int(expiry),
         )
-
-        return url
 
 
 @frappe.whitelist()
 def file_upload_to_s3(doc, method):
     """
-    check and upload files to s3. the path check and
+    Upload File doc's payload to S3 and update File.file_url appropriately.
+    Uses *regional* public URL for non-private files; presigned redirect for private.
     """
     s3_upload = S3Operations()
     path = doc.file_url
@@ -208,43 +188,56 @@ def file_upload_to_s3(doc, method):
     parent_doctype = doc.attached_to_doctype or 'File'
     parent_name = doc.attached_to_name
     ignore_s3_upload_for_doctype = frappe.local.conf.get('ignore_s3_upload_for_doctype') or ['Data Import']
-    if parent_doctype not in ignore_s3_upload_for_doctype:
-        if not doc.is_private:
-            file_path = site_path + '/public' + path
-        else:
-            file_path = site_path + path
-        key = s3_upload.upload_files_to_s3_with_key(
-            file_path, doc.file_name,
-            doc.is_private, parent_doctype,
-            parent_name
+
+    if parent_doctype in ignore_s3_upload_for_doctype:
+        return
+
+    file_path = site_path + ('/public' + path if not doc.is_private else path)
+
+    key = s3_upload.upload_files_to_s3_with_key(
+        file_path, doc.file_name, doc.is_private, parent_doctype, parent_name
+    )
+
+    if doc.is_private:
+        # Private: serve via presigned redirect method
+        method = "frappe_s3_attachment.controller.generate_file"
+        file_url = f"/api/method/{method}?key={key}&file_name={quote(doc.file_name or '', safe='')}"
+    else:
+        # Public: use regional, virtual-hosted style URL
+        region = s3_upload._get_bucket_region()
+        file_url = f"https://{s3_upload.BUCKET}.s3.{region}.amazonaws.com/{key}"
+
+    # Cleanup local temp
+    try:
+        os.remove(file_path)
+    except Exception:
+        pass
+
+    # Persist updates
+    frappe.db.sql(
+        """UPDATE `tabFile`
+           SET file_url=%s, folder=%s, old_parent=%s, content_hash=%s
+           WHERE name=%s""",
+        (file_url, 'Home/Attachments', 'Home/Attachments', key, doc.name)
+    )
+    doc.file_url = file_url
+
+    # If parent doctype has an image field, set it to this file_url
+    if parent_doctype and frappe.get_meta(parent_doctype).get('image_field'):
+        frappe.db.set_value(
+            parent_doctype,
+            parent_name,
+            frappe.get_meta(parent_doctype).get('image_field'),
+            file_url
         )
 
-        if doc.is_private:
-            method = "frappe_s3_attachment.controller.generate_file"
-            file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, doc.file_name)
-        else:
-            file_url = '{}/{}/{}'.format(
-                s3_upload.S3_CLIENT.meta.endpoint_url,
-                s3_upload.BUCKET,
-                key
-            )
-        os.remove(file_path)
-        frappe.db.sql("""UPDATE `tabFile` SET file_url=%s, folder=%s,
-            old_parent=%s, content_hash=%s WHERE name=%s""", (
-            file_url, 'Home/Attachments', 'Home/Attachments', key, doc.name))
-        
-        doc.file_url = file_url
-        
-        if parent_doctype and frappe.get_meta(parent_doctype).get('image_field'):
-            frappe.db.set_value(parent_doctype, parent_name, frappe.get_meta(parent_doctype).get('image_field'), file_url)
-
-        frappe.db.commit()
+    frappe.db.commit()
 
 
 @frappe.whitelist()
 def generate_file(key=None, file_name=None):
     """
-    Function to stream file from s3.
+    Redirect to a regional presigned URL for private files.
     """
     if key:
         s3_upload = S3Operations()
@@ -258,73 +251,70 @@ def generate_file(key=None, file_name=None):
 
 def upload_existing_files_s3(name, file_name):
     """
-    Function to upload all existing files.
+    Upload an existing File doc's file to S3 and rewrite its URL.
     """
     file_doc_name = frappe.db.get_value('File', {'name': name})
-    if file_doc_name:
-        doc = frappe.get_doc('File', name)
-        s3_upload = S3Operations()
-        path = doc.file_url
-        site_path = frappe.utils.get_site_path()
-        parent_doctype = doc.attached_to_doctype
-        parent_name = doc.attached_to_name
-        if not doc.is_private:
-            file_path = site_path + '/public' + path
-        else:
-            file_path = site_path + path
-        key = s3_upload.upload_files_to_s3_with_key(
-            file_path, doc.file_name,
-            doc.is_private, parent_doctype,
-            parent_name
-        )
+    if not file_doc_name:
+        return
 
-        if doc.is_private:
-            method = "frappe_s3_attachment.controller.generate_file"
-            file_url = """/api/method/{0}?key={1}""".format(method, key)
-        else:
-            file_url = '{}/{}/{}'.format(
-                s3_upload.S3_CLIENT.meta.endpoint_url,
-                s3_upload.BUCKET,
-                key
-            )
-        os.remove(file_path)
-        doc = frappe.db.sql("""UPDATE `tabFile` SET file_url=%s, folder=%s,
-            old_parent=%s, content_hash=%s WHERE name=%s""", (
-            file_url, 'Home/Attachments', 'Home/Attachments', key, doc.name))
-        frappe.db.commit()
+    doc = frappe.get_doc('File', name)
+    s3_upload = S3Operations()
+    path = doc.file_url
+    site_path = frappe.utils.get_site_path()
+    parent_doctype = doc.attached_to_doctype
+    parent_name = doc.attached_to_name
+
+    file_path = site_path + ('/public' + path if not doc.is_private else path)
+
+    key = s3_upload.upload_files_to_s3_with_key(
+        file_path, doc.file_name, doc.is_private, parent_doctype, parent_name
+    )
+
+    if doc.is_private:
+        method = "frappe_s3_attachment.controller.generate_file"
+        file_url = f"/api/method/{method}?key={key}"
     else:
+        region = s3_upload._get_bucket_region()
+        file_url = f"https://{s3_upload.BUCKET}.s3.{region}.amazonaws.com/{key}"
+
+    try:
+        os.remove(file_path)
+    except Exception:
         pass
+
+    frappe.db.sql(
+        """UPDATE `tabFile`
+           SET file_url=%s, folder=%s, old_parent=%s, content_hash=%s
+           WHERE name=%s""",
+        (file_url, 'Home/Attachments', 'Home/Attachments', key, doc.name)
+    )
+    frappe.db.commit()
 
 
 def s3_file_regex_match(file_url):
     """
-    Match the public file regex match.
+    Match public (https) URLs or private presigned redirect route.
     """
     return re.match(
-        r'^(https:|/api/method/frappe_s3_attachment.controller.generate_file)',
-        file_url
+        r'^(https://|/api/method/frappe_s3_attachment.controller.generate_file)',
+        file_url or ""
     )
 
 
 @frappe.whitelist()
 def migrate_existing_files():
     """
-    Function to migrate the existing files to s3.
+    Migrate all existing File docs that aren't already S3 URLs or private routes.
     """
-    # get_all_files_from_public_folder_and_upload_to_s3
-    files_list = frappe.get_all(
-        'File',
-        fields=['name', 'file_url', 'file_name']
-    )
+    files_list = frappe.get_all('File', fields=['name', 'file_url', 'file_name'])
     for file in files_list:
-        if file['file_url']:
-            if not s3_file_regex_match(file['file_url']):
-                upload_existing_files_s3(file['name'], file['file_name'])
+        if file['file_url'] and not s3_file_regex_match(file['file_url']):
+            upload_existing_files_s3(file['name'], file['file_name'])
     return True
 
 
 def delete_from_cloud(doc, method):
-    """Delete file from s3"""
+    """Hook: delete file from S3 when File doc is deleted (if enabled)."""
     s3 = S3Operations()
     s3.delete_from_s3(doc.content_hash)
 
@@ -332,6 +322,6 @@ def delete_from_cloud(doc, method):
 @frappe.whitelist()
 def ping():
     """
-    Test function to check if api function work.
+    Simple test function.
     """
     return "pong"
